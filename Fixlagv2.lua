@@ -37,7 +37,7 @@ task.spawn(function()
     local coreGui = game:GetService("CoreGui")
     -- Đợi Menu Kavo xuất hiện
     -- Sửa lại tên này cho giống hệt dòng số 3 trong ảnh của sếp
-local screenGui = coreGui:WaitForChild("DORO Fix Lag 🍎 🐧 [PRO CONFIG]", 10)
+local screenGui = coreGui:WaitForChild("DORO Fix Lag 🍊 🐧 [PRO CONFIG]", 10)
     if screenGui then
         local mainFrame = screenGui:FindFirstChild("Main")
         if mainFrame then
