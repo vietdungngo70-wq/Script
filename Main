@@ -1,0 +1,373 @@
+-- [[ 🌑 DORO v250 - INCREMENTAL OPTIMIZER ]]
+-- 🎯 Build cache incrementally, spatial lazy hide, no idle loops
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+local CoreGui = game:GetService("CoreGui")
+local Stats = game:GetService("Stats")
+local lp = game:GetService("Players").LocalPlayer
+
+-- ========== CẤU HÌNH ==========
+local CONFIG = {
+adaptive = true,
+ramThreshHigh = 2800,
+ramThreshLow = 2200,
+fpsCap = 15,
+renderDistance = 120,
+hideInterval = 5,
+spatialBucketSize = 50,   -- chunk size (studs)
+}
+
+-- ========== BIẾN TOÀN CỤC ==========
+local currentNoRender = false
+local currentSmartHide = true
+local partsByBucket = {}       -- [bucketKey] = {list of parts}
+local playerBucket = nil
+local hideTask = nil
+local textureDecalsProcessed = false
+local effectCleaned = false
+local plasticApplied = false
+
+-- ========== HELPER: BUCKET KEY ==========
+local function getBucketKey(pos)
+local bx = math.floor(pos.X / CONFIG.spatialBucketSize)
+local bz = math.floor(pos.Z / CONFIG.spatialBucketSize)
+return bx .. "," .. bz
+end
+
+-- ========== CACHE PART INCREMENTALLY ==========
+local function addPartToBucket(part)
+if not part:IsA("BasePart") then return end
+local key = getBucketKey(part.Position)
+if not partsByBucket[key] then
+partsByBucket[key] = {}
+end
+table.insert(partsByBucket[key], part)
+end
+
+local function removePartFromBucket(part)
+local key = getBucketKey(part.Position)
+local bucket = partsByBucket[key]
+if bucket then
+for i, p in ipairs(bucket) do
+if p == part then
+table.remove(bucket, i)
+break
+end
+end
+if #bucket == 0 then partsByBucket[key] = nil end
+end
+end
+
+-- Quét workspace hiện tại (có yield để không freeze)
+task.spawn(function()
+local descendants = Workspace:GetDescendants()
+for i = 1, #descendants do
+addPartToBucket(descendants[i])
+if i % 500 == 0 then task.wait() end
+end
+print("[DORO] Initial part buckets: " .. table.count(partsByBucket) .. " chunks")
+end)
+
+-- Lắng nghe part mới sinh
+Workspace.DescendantAdded:Connect(function(v)
+if v:IsA("BasePart") then
+-- Đợi 1 frame để part có position ổn định
+task.defer(function() addPartToBucket(v) end)
+end
+end)
+
+Workspace.DescendantRemoving:Connect(function(v)
+if v:IsA("BasePart") then
+removePartFromBucket(v)
+end
+end)
+
+-- ========== BẬT/TẮT NO RENDER ==========
+local function setNoRender(enable)
+if currentNoRender == enable then return end
+currentNoRender = enable
+pcall(function() RunService:Set3dRenderingEnabled(not enable) end)
+if enable then
+if currentSmartHide then setSmartHide(false) end
+else
+if CONFIG.smartHideUserPreference == nil or CONFIG.smartHideUserPreference then
+setSmartHide(true)
+end
+end
+print("[DORO] NO RENDER: " .. (enable and "ON" or "OFF"))
+end
+
+-- ========== SPATIAL SMART HIDE (chỉ xử lý chunk xung quanh) ==========
+local function updateHideForCurrentPlayer()
+local char = lp.Character
+local root = char and char:FindFirstChild("HumanoidRootPart")
+if not root then return end
+local newBucket = getBucketKey(root.Position)
+if newBucket == playerBucket then return end
+playerBucket = newBucket
+
+-- Các bucket cần render: bucket hiện tại và 8 bucket xung quanh  
+local bx, bz = playerBucket:match("(.-),(.*)")  
+bx, bz = tonumber(bx), tonumber(bz)  
+local activeBuckets = {}  
+for dx = -1, 1 do  
+    for dz = -1, 1 do  
+        local key = (bx + dx) .. "," .. (bz + dz)  
+        activeBuckets[key] = true  
+    end  
+end  
+
+-- Set transparency cho các part trong bucket  
+for key, bucket in pairs(partsByBucket) do  
+    local visible = activeBuckets[key] == true  
+    local targetTrans = visible and 0 or 1  
+    for _, part in ipairs(bucket) do  
+        if part and part.Parent then  
+            if part.LocalTransparencyModifier ~= targetTrans then  
+                part.LocalTransparencyModifier = targetTrans  
+            end  
+        end  
+    end  
+end
+
+end
+
+local function setSmartHide(enable)
+if currentSmartHide == enable then return end
+currentSmartHide = enable
+if enable then
+if hideTask then task.cancel(hideTask) end
+hideTask = task.spawn(function()
+while task.wait(CONFIG.hideInterval) do
+if not currentSmartHide or currentNoRender then break end
+updateHideForCurrentPlayer()
+end
+end)
+updateHideForCurrentPlayer() -- chạy ngay lần đầu
+else
+if hideTask then task.cancel(hideTask); hideTask = nil end
+-- reset tất cả part về visible
+for _, bucket in pairs(partsByBucket) do
+for _, part in ipairs(bucket) do
+pcall(function()
+if part.LocalTransparencyModifier ~= 0 then
+part.LocalTransparencyModifier = 0
+end
+end)
+end
+end
+print("[DORO] SMART HIDE: OFF")
+end
+end
+
+-- ========== TEXTURE/DECAL: CHỈ 1 LẦN + DESCENDANTADDED ==========
+local function cleanTextureDecal(obj)
+if obj:IsA("Texture") or obj:IsA("Decal") then
+pcall(function()
+if obj.Transparency < 1 then obj.Transparency = 1 end
+end)
+end
+end
+
+task.spawn(function()
+local descendants = game:GetDescendants()
+for i = 1, #descendants do
+cleanTextureDecal(descendants[i])
+if i % 500 == 0 then task.wait() end
+end
+textureDecalsProcessed = true
+print("[DORO] Texture/decal initial cleanup done")
+end)
+
+game.DescendantAdded:Connect(function(v)
+if not textureDecalsProcessed then return end
+cleanTextureDecal(v)
+end)
+
+-- ========== EFFECT CLEANUP (MỘT LẦN) ==========
+task.spawn(function()
+local heavyEffects = {"ParticleEmitter","Trail","Beam","Fire","Smoke","Sparkles"}
+local count = 0
+local descendants = game:GetDescendants()
+for i = 1, #descendants do
+local v = descendants[i]
+for _, t in ipairs(heavyEffects) do
+if v:IsA(t) then
+pcall(v.Destroy, v)
+count = count + 1
+break
+end
+end
+if i % 500 == 0 then task.wait() end
+end
+effectCleaned = true
+print("[DORO] Removed " .. count .. " heavy effects")
+end)
+
+-- ========== PLASTIC MATERIAL (MỘT LẦN) ==========
+task.spawn(function()
+local parts = {}
+local descendants = Workspace:GetDescendants()
+for i = 1, #descendants do
+if descendants[i]:IsA("BasePart") then
+table.insert(parts, descendants[i])
+end
+if i % 300 == 0 then task.wait() end
+end
+for i, v in ipairs(parts) do
+pcall(function()
+if v.Material ~= Enum.Material.Plastic then v.Material = Enum.Material.Plastic end
+v.CastShadow = false
+v.Reflectance = 0
+end)
+if i % 2000 == 0 then task.wait() end
+end
+plasticApplied = true
+print("[DORO] Plastic set on " .. #parts .. " parts")
+end)
+
+-- ========== LIGHTING & RENDER ==========
+pcall(function()
+settings().Rendering.QualityLevel = 1
+Lighting.GlobalShadows = false
+Lighting.Brightness = 0
+Lighting.FogEnd = 9e9
+for _, v in pairs(Lighting:GetDescendants()) do
+if v:IsA("BloomEffect") or v:IsA("Atmosphere") then
+pcall(v.Destroy, v)
+end
+end
+end)
+
+-- ========== ADAPTIVE MODE ==========
+if CONFIG.adaptive then
+task.spawn(function()
+while task.wait(15) do
+local ram = math.floor(Stats:GetTotalMemoryUsageMb())
+if ram > CONFIG.ramThreshHigh and not currentNoRender then
+setNoRender(true)
+elseif ram < CONFIG.ramThreshLow and currentNoRender then
+setNoRender(false)
+end
+end
+end)
+end
+
+-- ========== FPS CAP ==========
+if setfpscap then setfpscap(CONFIG.fpsCap) end
+
+-- ========== CORE GUI CLEANER AN TOÀN ==========
+task.spawn(function()
+local ignoreNames = {"RobloxGui","CoreScript","Chat","StartGame"}
+for _, v in pairs(CoreGui:GetChildren()) do
+if v:IsA("ScreenGui") then
+local shouldHide = true
+for _, ign in ipairs(ignoreNames) do
+if v.Name == ign then shouldHide = false break end
+end
+local lowerName = v.Name:lower()
+if lowerName:find("delta") or lowerName:find("arceus") or lowerName:find("krnl") then
+shouldHide = false
+end
+if shouldHide then
+pcall(function() v.Enabled = false end)
+end
+end
+end
+end)
+
+-- ========== UI TOGGLE ==========
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "Doro250UI"
+screenGui.Parent = CoreGui
+
+local frame = Instance.new("Frame")
+frame.Size = UDim2.new(0, 220, 0, 100)
+frame.Position = UDim2.new(0.5, -110, 0, 10)
+frame.BackgroundColor3 = Color3.new(0,0,0)
+frame.BackgroundTransparency = 0.5
+frame.Parent = screenGui
+Instance.new("UICorner", frame)
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1,0,0,25)
+title.Position = UDim2.new(0,0,0,0)
+title.BackgroundTransparency = 1
+title.Text = "DORO v250 INCREMENTAL"
+title.TextColor3 = Color3.new(0,1,1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 11
+
+local btnNR = Instance.new("TextButton", frame)
+btnNR.Size = UDim2.new(0, 100, 0, 25)
+btnNR.Position = UDim2.new(0.5, -105, 0, 30)
+btnNR.BackgroundColor3 = Color3.new(0.6,0,0)
+btnNR.Text = "NO RENDER OFF"
+btnNR.Font = Enum.Font.GothamBold
+btnNR.TextSize = 11
+Instance.new("UICorner", btnNR)
+
+local btnSH = Instance.new("TextButton", frame)
+btnSH.Size = UDim2.new(0, 100, 0, 25)
+btnSH.Position = UDim2.new(0.5, 5, 0, 30)
+btnSH.BackgroundColor3 = Color3.new(0,0.6,0)
+btnSH.Text = "HIDE ON"
+btnSH.Font = Enum.Font.GothamBold
+btnSH.TextSize = 11
+Instance.new("UICorner", btnSH)
+
+local ramLabel = Instance.new("TextLabel", frame)
+ramLabel.Size = UDim2.new(1,0,0,25)
+ramLabel.Position = UDim2.new(0,0,0,65)
+ramLabel.BackgroundTransparency = 1
+ramLabel.TextColor3 = Color3.new(0.8,0.8,0.8)
+ramLabel.Font = Enum.Font.Gotham
+ramLabel.TextSize = 10
+
+btnNR.MouseButton1Click:Connect(function()
+local newState = not currentNoRender
+setNoRender(newState)
+btnNR.BackgroundColor3 = newState and Color3.new(0,0.6,0) or Color3.new(0.6,0,0)
+btnNR.Text = newState and "NO RENDER ON" or "NO RENDER OFF"
+if not newState and CONFIG.smartHideUserPreference == nil then
+CONFIG.smartHideUserPreference = true
+end
+end)
+
+local function updateHideButton()
+btnSH.BackgroundColor3 = currentSmartHide and Color3.new(0,0.6,0) or Color3.new(0.6,0,0)
+btnSH.Text = currentSmartHide and "HIDE ON" or "HIDE OFF"
+end
+
+btnSH.MouseButton1Click:Connect(function()
+if currentNoRender then
+print("[DORO] Cannot toggle HIDE when NO RENDER is ON")
+return
+end
+local newState = not currentSmartHide
+setSmartHide(newState)
+CONFIG.smartHideUserPreference = newState
+updateHideButton()
+end)
+
+updateHideButton()
+setSmartHide(true)
+
+task.spawn(function()
+while task.wait(2) do
+local ram = math.floor(Stats:GetTotalMemoryUsageMb())
+local mode = currentNoRender and "NO RENDER" or "RENDER ON"
+local bucketCount = 0
+for _ in pairs(partsByBucket) do bucketCount = bucketCount + 1 end
+ramLabel.Text = string.format("RAM: %d MB | %s | Hide: %s | Chunks: %d", ram, mode, currentSmartHide and "ON" or "OFF", bucketCount)
+end
+end)
+
+print("DORO v250 INCREMENTAL OPTIMIZER loaded")
+print("- Spatial bucketing (chunk-based hide)")
+print("- Incremental cache via DescendantAdded")
+print("- Texture/decal: one-time + listener")
